@@ -1,0 +1,54 @@
+[tool.poetry]
+name = "catboost-matrix-classifier"
+version = "0.1.0"
+description = "A classification model that accepts numerical matrices using CatBoost"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+license = "MIT"
+packages = [{include = "catboost_classifier"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+numpy = ">=1.26.0"
+scipy = ">=1.11.3"
+pandas = ">=2.1.0"
+scikit-learn = ">=1.3.2"
+pillow = ">=10.1.0"
+cython = ">=3.0.0"
+catboost = "1.2.8"
+shap = ">=0.43.0"
+flask = "*"
+gevent = "*"
+gunicorn = "*"
+boto3 = "*"
+s3fs = "*"
+joblib = "*"
+loguru = "^0.7.3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
+black = ">=23.0.0"
+isort = ">=5.12.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

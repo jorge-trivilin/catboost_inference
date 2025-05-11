@@ -1,0 +1,9 @@
+catboost
+numpy
+pandas
+scikit-learn
+flask
+gunicorn
+sagemaker-inference
+multi-model-server
+loguru

@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+
+import os
+import json
+import flask
+import signal
+import traceback
+import sys
+
+import pandas as pd
+from io import StringIO 
+
+# Import inference handler
+import inference
+
+# Define some global variables
+prefix = '/opt/ml/'
+model_path = os.path.join(prefix, 'model')
+
+# A singleton for holding the model
+class ScoringService(object):
+    model = None
+    
+    @classmethod
+    def get_model(cls):
+        # Load model if it's not already loaded
+        if cls.model is None:
+            cls.model = inference.model_fn(model_path)
+        return cls.model
+    
+    @classmethod
+    def predict(cls, input_data, content_type):
+        """Make prediction using the model
+        
+        Args:
+            input_data: Input data in the format specified by content_type
+            content_type: MIME type of the input data
+        
+        Returns:
+            Prediction output
+        """
+        model = cls.get_model()
+        data = inference.input_fn(input_data, content_type)
+        prediction = inference.predict_fn(data, model)
+        return prediction
+
+
+# The flask app for serving predictions
+app = flask.Flask(__name__)
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Health check endpoint for the container
+    
+    Called by SageMaker to check if the container is ready.
+    """
+    # Check if the model was loaded
+    health = ScoringService.get_model() is not None
+    
+    status = 200 if health else 404
+    return flask.Response(response='\n', status=status, mimetype='application/json')
+
+@app.route('/invocations', methods=['POST'])
+def transformation():
+    """Prediction endpoint
+    
+    Called by SageMaker for prediction. The data and content type are provided
+    in the request.
+    """
+    # Get input
+    content_type = flask.request.content_type
+    
+    # Check content type
+    if not content_type:
+        return flask.Response(
+            response=json.dumps({'error': 'Content type not specified'}),
+            status=415, mimetype='application/json')
+    
+    # Validate content type
+    if content_type not in ['application/json', 'text/csv']:
+        return flask.Response(
+            response=json.dumps({'error': f'Content type {content_type} not supported'}),
+            status=415, mimetype='application/json')
+    
+    # Load model
+    try:
+        data = flask.request.data.decode('utf-8')
+        prediction = ScoringService.predict(data, content_type)
+    except Exception as e:
+        return flask.Response(
+            response=json.dumps({'error': str(e), 'trace': traceback.format_exc()}),
+            status=500, mimetype='application/json')
+    
+    # Determine accept type
+    accept = flask.request.headers.get('Accept', 'application/json')
+    
+    # Format output
+    result, mime_type = inference.output_fn(prediction, accept)
+    
+    return flask.Response(response=result, status=200, mimetype=mime_type)
+
+
+# Define signal handlers
+def sigterm_handler(nginx_pid, gunicorn_pid):
+    try:
+        os.kill(nginx_pid, signal.SIGQUIT)
+    except OSError:
+        pass
+    try:
+        os.kill(gunicorn_pid, signal.SIGTERM)
+    except OSError:
+        pass
+    
+    sys.exit(0)
+
+def start_server():
+    print('Starting the server...')
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Main function
+if __name__ == '__main__':
+    start_server()

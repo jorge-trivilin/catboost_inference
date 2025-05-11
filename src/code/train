@@ -1,0 +1,418 @@
+#!/usr/bin/python3
+
+# A generic train component for CatBoost that works with any input data.
+
+from __future__ import print_function
+
+import os
+import json
+import pickle
+import sys
+import traceback
+import argparse
+import time
+import pandas as pd
+import csv
+from catboost import CatBoostClassifier, Pool as CatboostPool, cv
+from itertools import chain
+from pandas.api.types import CategoricalDtype
+from sklearn import metrics
+
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+# Channel paths
+train_channel_name = 'train'
+validation_chanel_name = 'validation'
+training_path = os.path.join(input_path, train_channel_name)
+validation_path = os.path.join(input_path, validation_chanel_name)
+
+
+def detect_column_types(df, target_col=None):
+    """Auto-detect column types from the data"""
+    num_cols = []
+    cat_cols = []
+    text_cols = []
+    
+    # Detect column types
+    for col in df.columns:
+        # Skip target column
+        if col == target_col:
+            continue
+            
+        # Numeric columns
+        if pd.api.types.is_numeric_dtype(df[col]):
+            num_cols.append(col)
+        # Categorical columns (few unique values)
+        elif df[col].nunique() < min(10, len(df) * 0.05):
+            cat_cols.append(col)
+        # Text columns (everything else)
+        else:
+            text_cols.append(col)
+    
+    return num_cols, cat_cols, text_cols
+
+
+def ret_pool_obj(X, text_features=None, cat_features=None):
+    """Create a CatBoost Pool with specified features"""
+    # Filter columns
+    valid_text = [col for col in (text_features or []) if col in X.columns]
+    valid_cat = [col for col in (cat_features or []) if col in X.columns]
+    
+    pool_obj = CatboostPool(
+        data=X,
+        label=None,
+        text_features=valid_text,
+        cat_features=valid_cat,
+        feature_names=list(X.columns)
+    )
+    return pool_obj
+
+
+def fit_catboost(X_train, y_train, weight, text_cols=None, cat_cols=None, catboost_params=None, verbose=100):
+    """Train CatBoost model with specified features"""
+    # Filter columns
+    valid_text = [col for col in (text_cols or []) if col in X_train.columns]
+    valid_cat = [col for col in (cat_cols or []) if col in X_train.columns]
+    
+    learn_pool = CatboostPool(
+        X_train,
+        y_train,
+        weight=weight,
+        text_features=valid_text,
+        cat_features=valid_cat,
+        feature_names=list(X_train.columns)
+    )
+    
+    if catboost_params is None:
+        catboost_params = {}
+        
+    model = CatBoostClassifier(**catboost_params)
+    model.fit(learn_pool, verbose=verbose)
+    
+    return model
+
+
+def pre_process(df, num_cols=None, cat_cols=None, text_cols=None):
+    """Generic preprocessing for any dataframe"""
+    # Handle text columns
+    for col in (text_cols or []):
+        if col in df.columns:
+            df[col] = df[col].fillna('')
+    
+    # Handle categorical columns
+    for col in (cat_cols or []):
+        if col in df.columns:
+            df[col] = df[col].fillna('Unk')
+    
+    # Handle numerical columns
+    for col in (num_cols or []):
+        if col in df.columns:
+            df[col] = df[col].fillna(-9999)
+    
+    # Handle any remaining columns
+    for col in df.columns:
+        if col not in (num_cols or []) and col not in (cat_cols or []) and col not in (text_cols or []):
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(-9999)
+            else:
+                df[col] = df[col].fillna('Unk')
+    
+    return df
+
+
+def pre_process_cat(df, obj_col_categories, cat_cols=None):
+    """Apply categorical preprocessing"""
+    for col_name in (cat_cols or []):
+        if col_name in df.columns and col_name in obj_col_categories:
+            cat_type = CategoricalDtype(categories=obj_col_categories.get(col_name), ordered=False)
+            df[col_name] = df[col_name].astype(cat_type, copy=False)
+            df[col_name] = df[col_name].fillna('Unk')
+    
+    return df
+
+
+# The function to execute the training
+def train(args):
+    print('Starting the train.')
+    try:
+        # Load hyperparameters
+        with open(param_path, 'r') as tc:
+            training_params = json.load(tc)
+
+        print(f"Training path: {training_path}")
+        print(f"Validation path: {validation_path}")
+        
+        hpo_flag = args.HPO
+        print(f"HPO flag: {hpo_flag}")
+        
+        # Load column configuration if provided
+        column_config = None
+        if args.config and os.path.exists(args.config):
+            with open(args.config, 'r') as f:
+                column_config = json.load(f)
+                print(f"Loaded column configuration from {args.config}")
+        else:
+            config_path = os.path.join(training_path, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    column_config = json.load(f)
+                    print(f"Loaded column configuration from training directory")
+        
+        # Get target column name
+        target_col = args.target_column
+        if column_config and "target_col" in column_config:
+            target_col = column_config["target_col"]
+        print(f"Target column: {target_col or 'auto-detect'}")
+        
+        # List training files
+        input_files = [os.path.join(training_path, file) for file in os.listdir(training_path) 
+                       if not file.endswith('.json')]
+        
+        if len(input_files) == 0:
+            raise ValueError(f"No files found in {training_path}")
+        
+        # Determine separator and headers for first file
+        with open(input_files[0], 'r') as f:
+            first_line = f.readline().strip()
+        
+        sep = '\t' if '\t' in first_line else ','
+        first_char = first_line.split(sep)[0].strip()[0] if first_line else ''
+        has_headers = not first_char.isdigit()
+        
+        print(f"Detected separator: '{sep}', Headers: {has_headers}")
+        
+        # Read training data
+        if has_headers:
+            raw_data = [
+                pd.read_csv(file, sep=sep, lineterminator='\n', quotechar='"', 
+                           quoting=csv.QUOTE_ALL if sep == '\t' else csv.QUOTE_MINIMAL) 
+                for file in input_files
+            ]
+        else:
+            raw_data = [pd.read_csv(file, header=None, sep=sep) for file in input_files]
+            
+            # Assign generic column names
+            for df in raw_data:
+                for i in range(df.shape[1]):
+                    df.rename(columns={i: f"feature_{i}"}, inplace=True)
+                
+                # If no target specified, assume last column is target
+                if target_col is None:
+                    target_col = f"feature_{df.shape[1]-1}"
+                    print(f"No target specified, using last column: {target_col}")
+        
+        # Combine all files
+        train_data = pd.concat(raw_data)
+        print(f"Training data shape: {train_data.shape}")
+        print(f"Training data columns: {train_data.columns.tolist()}")
+        
+        # Auto-detect or use provided column types
+        if column_config:
+            num_cols = column_config.get("numerical_cols", [])
+            cat_cols = column_config.get("categorical_cols", [])
+            text_cols = column_config.get("text_cols", [])
+            print("Using column types from configuration")
+        else:
+            num_cols, cat_cols, text_cols = detect_column_types(train_data, target_col)
+            print("Auto-detected column types")
+        
+        print(f"Column types - Numerical: {num_cols}")
+        print(f"Column types - Categorical: {cat_cols}")
+        print(f"Column types - Text: {text_cols}")
+        
+        # Preprocess training data
+        train_data = pre_process(train_data, num_cols, cat_cols, text_cols)
+        
+        # Process validation data if HPO enabled
+        validation_data = None
+        if hpo_flag == 1:
+            validation_files = [os.path.join(validation_path, file) for file in os.listdir(validation_path)
+                               if not file.endswith('.json')]
+            
+            if len(validation_files) == 0:
+                print("No validation files found, skipping validation")
+            else:
+                # Use same reading logic for validation data
+                if has_headers:
+                    val_data = [
+                        pd.read_csv(file, sep=sep, lineterminator='\n', quotechar='"', 
+                                   quoting=csv.QUOTE_ALL if sep == '\t' else csv.QUOTE_MINIMAL) 
+                        for file in validation_files
+                    ]
+                else:
+                    val_data = [pd.read_csv(file, header=None, sep=sep) for file in validation_files]
+                    
+                    # Assign same column names
+                    for df in val_data:
+                        for i in range(df.shape[1]):
+                            df.rename(columns={i: f"feature_{i}"}, inplace=True)
+                
+                validation_data = pd.concat(val_data)
+                validation_data = pre_process(validation_data, num_cols, cat_cols, text_cols)
+                print(f"Validation data shape: {validation_data.shape}")
+        
+        # Process categorical mappings
+        obj_col_categories = {}
+        for col_name in cat_cols:
+            if col_name in train_data.columns:
+                cat = [list(train_data[col_name].value_counts().to_dict().keys()) + ['Unk']]
+                print(f"{col_name}: Categorical Levels: {len(cat[0])}")
+                obj_col_categories[col_name] = set(chain.from_iterable(cat))
+                cat_type = CategoricalDtype(categories=obj_col_categories.get(col_name), ordered=False)
+                train_data[col_name] = train_data[col_name].astype(cat_type, copy=False)
+                train_data[col_name] = train_data[col_name].fillna('Unk')
+        
+        # Apply categorical preprocessing to validation data if available
+        if validation_data is not None:
+            validation_data = pre_process_cat(validation_data, obj_col_categories, cat_cols)
+        
+        # Setup training parameters
+        start_time = time.time()
+        
+        iterations = int(training_params.get('iterations', 50000))
+        learning_rate = float(training_params.get('learning_rate', 0.05))
+        max_depth = int(training_params.get('max_depth', 10))
+        max_ctr_complexity = int(training_params.get('max_ctr_complexity', 15))
+        
+        print('Training Started')
+        
+        # Verify target column exists
+        if target_col not in train_data.columns:
+            raise ValueError(f"Target column '{target_col}' not found in training data")
+        
+        # Set weights
+        weight = [1.0] * train_data.shape[0]
+        
+        # Setup CatBoost parameters
+        params = {
+            'iterations': iterations,
+            'depth': max_depth,
+            'learning_rate': learning_rate,
+            'loss_function': 'Logloss',
+            'eval_metric': 'PRAUC:use_weights=False',
+            'random_seed': 42,
+            'border_count': 254,
+            'logging_level': 'Verbose',
+            'use_best_model': False,
+            'early_stopping_rounds': 500,
+            'task_type': "GPU",
+            'one_hot_max_size': 253,
+            'metric_period': 100,
+            "text_processing": {
+                "tokenizers": [
+                    {
+                        'tokenizer_id': 'Sense',
+                        'separator_type': 'BySense',
+                        "lowercasing": "true",
+                    }
+                ],
+                "dictionaries": [{
+                    "dictionary_id": "CharTriGram",
+                    "token_level_type": "Letter",
+                    "gram_order": "3",
+                    "max_dictionary_size": "20000",
+                }],
+                "feature_processing": {
+                    "default": [{
+                        "tokenizers_names": ["Sense"],
+                        "dictionaries_names": ["CharTriGram"],
+                        "feature_calcers": ["BoW:top_tokens_count=1000", "NaiveBayes"]
+                    }]
+                }
+            }
+        }
+        
+        # Get feature columns (all columns except target)
+        feature_cols = [col for col in train_data.columns if col != target_col]
+        
+        # Train the model
+        model = fit_catboost(
+            train_data[feature_cols], 
+            train_data[target_col], 
+            weight,
+            text_cols=text_cols,
+            cat_cols=cat_cols,
+            catboost_params=params
+        )
+        
+        print(f"Training completed in {time.time() - start_time:.2f} seconds")
+        
+        # Evaluate on validation data if provided
+        if validation_data is not None:
+            val_feature_cols = [col for col in feature_cols if col in validation_data.columns]
+            input_pool = ret_pool_obj(
+                validation_data[val_feature_cols],
+                text_features=text_cols,
+                cat_features=cat_cols
+            )
+            prob = model.predict_proba(input_pool)[:, 1]
+            precision, recall, thresholds = metrics.precision_recall_curve(validation_data[target_col].values, prob)
+            auc = metrics.auc(recall, precision)
+            print(f'AUC: {auc}')
+        
+        # Save the model
+        model.save_model(
+            os.path.join(model_path, 'model-classification-prod'), 
+            format="cbm", 
+            export_parameters=None,
+            pool=None
+        )
+        
+        # Save categorical mappings
+        with open(os.path.join(model_path, 'obj_col_categories.pkl'), 'wb') as out:
+            pickle.dump(obj_col_categories, out)
+        
+        # Save column configuration
+        column_config_to_save = {
+            "numerical_cols": num_cols,
+            "categorical_cols": cat_cols,
+            "text_cols": text_cols,
+            "target_col": target_col
+        }
+        with open(os.path.join(model_path, 'column_config.json'), 'w') as out:
+            json.dump(column_config_to_save, out)
+        
+        print('Training complete.')
+        
+    except Exception as e:
+        # Write out error file
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during train: ' + str(e) + '\n' + trc)
+        print('Exception during train: ' + str(e) + '\n' + trc, file=sys.stderr)
+        sys.exit(255)
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(
+        description="Generic script to train a CatBoost classification model."
+    )
+    
+    parser.add_argument("--HPO",
+                        help="Enable hyperparameter optimization",
+                        type=int,
+                        default=1)
+    
+    parser.add_argument("--config",
+                        help="Path to column configuration JSON file",
+                        type=str,
+                        default=None)
+    
+    parser.add_argument("--target_column",
+                        help="Name of the target column",
+                        type=str,
+                        default=None)
+    
+    return parser
+
+
+if __name__ == "__main__":
+    print('Starting training process')
+    args = get_parser().parse_args()
+    train(args)
+    sys.exit(0)
