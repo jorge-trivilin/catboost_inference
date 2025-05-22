@@ -1,0 +1,115 @@
+#!/usr/bin/env python
+
+# This file implements the scoring service shell. You don't necessarily need to modify it for various
+# algorithms. It starts nginx and gunicorn with the correct configurations and then simply waits until
+# gunicorn exits.
+#
+# The flask server is specified to be the app object in wsgi.py
+#
+# We set the following parameters:
+#
+# Parameter                Environment Variable              Default Value
+# ---------                --------------------              -------------
+# number of workers        MODEL_SERVER_WORKERS              the number of CPU cores
+# timeout                  MODEL_SERVER_TIMEOUT              60 seconds
+
+from __future__ import print_function
+import multiprocessing
+import os
+import signal
+import subprocess
+import sys
+from loguru import logger
+from typing import NoReturn, Set, Tuple, Optional, Any
+
+cpu_count: int = multiprocessing.cpu_count()
+
+model_server_timeout: str = os.environ.get('MODEL_SERVER_TIMEOUT', '3600')
+model_server_workers: int = int(os.environ.get('MODEL_SERVER_WORKERS', str(cpu_count)))
+
+def sigterm_handler(
+    nginx_pid: int,
+    gunicorn_pid: int
+    ) -> NoReturn:
+    """Handle termination signals by stopping nginx and gunicorn processes.
+    
+    This function is called when a SIGTERM signal is received. It attempts to
+    gracefully shutdown both the nginx and gunicorn processes before exiting
+    the program.
+    
+    Args:
+        nginx_pid (int): Process ID of the nginx server
+        gunicorn_pid (int): Process ID of the gunicorn server
+        
+    Returns:
+        NoReturn: Function calls sys.exit() and never returns
+        
+    Raises:
+        No exceptions are raised, OSError is caught and ignored
+    """
+    try:
+        os.kill(nginx_pid, signal.SIGQUIT)
+    except OSError:
+        pass
+    try:
+        os.kill(gunicorn_pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+    sys.exit(0)
+
+def start_server() -> None:
+    """Start the inference server with nginx and gunicorn.
+    
+    This function:
+    1. Sets up nginx access and error log forwarding to docker
+    2. Starts nginx server with specified configuration
+    3. Starts gunicorn workers with specified timeout and worker count
+    4. Sets up signal handling for graceful shutdown
+    5. Monitors processes and handles termination
+    
+    The server uses:
+    - nginx as the front-end server
+    - gunicorn as the WSGI application server
+    - gevent for async worker processing
+    - Unix domain sockets for nginx-gunicorn communication
+    
+    Environment Variables:
+        MODEL_SERVER_TIMEOUT (str): Server timeout in seconds
+        MODEL_SERVER_WORKERS (int): Number of gunicorn workers
+        
+    Returns:
+        None
+        
+    Raises:
+        subprocess.CalledProcessError: If log file symlinks cannot be created
+        subprocess.SubprocessError: If nginx or gunicorn fails to start
+    """
+    logger.info('Starting the inference server with {} workers.', model_server_workers)
+
+    # Forward request and error logs to docker log collector
+    subprocess.check_call(['ln', '-sf', '/dev/stdout', '/var/log/nginx/access.log'])
+    subprocess.check_call(['ln', '-sf', '/dev/stderr', '/var/log/nginx/error.log'])
+
+    nginx: subprocess.Popen = subprocess.Popen(['nginx', '-c', '/opt/program/nginx.conf'])
+    gunicorn: subprocess.Popen = subprocess.Popen(['gunicorn',
+                                 '--timeout', str(model_server_timeout),
+                                 '-k', 'gevent',
+                                 '-b', 'unix:/tmp/gunicorn.sock',
+                                 '-w', str(model_server_workers),
+                                 'wsgi:app'])
+
+    signal.signal(signal.SIGTERM, lambda a, b: sigterm_handler(nginx.pid, gunicorn.pid))
+
+    pids: Set[int] = {nginx.pid, gunicorn.pid}
+    while True:
+        pid, _status = os.wait()
+        if pid in pids:
+            break
+
+    sigterm_handler(nginx.pid, gunicorn.pid)
+    logger.info('Inference server exiting')
+
+
+if __name__ == '__main__':
+    start_server()

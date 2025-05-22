@@ -1,8 +1,8 @@
 [tool.poetry]
-name = "catboost-matrix-classifier"
+name = "catboost-matrix-classifier-inference-container"
 version = "0.1.0"
-description = "A classification model that accepts numerical matrices using CatBoost"
-authors = ["Your Name <your.email@example.com>"]
+description = "A inference container for classification model that accepts numerical matrices using CatBoost"
+authors = ["Jorge Trivilin jorge.trivilin@gmail.com>"]
 readme = "README.md"
 license = "MIT"
 packages = [{include = "catboost_classifier"}]

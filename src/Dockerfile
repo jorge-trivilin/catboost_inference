@@ -72,7 +72,7 @@ ENV PATH="/opt/program:${PATH}"
 ENV SAGEMAKER_PROGRAM=serve
 
 
-COPY code/* /opt/program/
+COPY inference/* /opt/program/
 WORKDIR /opt/program/
 RUN chmod +x /opt/program/serve
 
